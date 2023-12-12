@@ -104,10 +104,12 @@ class PatientDataset(Dataset):
 def custom_collate(batch):
     featU, iatU, maskU, histU, featN, iatN, maskN, histN = zip(*batch)
 
-    def pad_pack(obj, nulls):
+    def pad_pack(obj, nulls, pad=0, marker=False):
         obj = [o if o is not None else nulls for o in obj]
         lengths = [seq.shape[0] for seq in obj]
-        obj_padded = pad_sequence(obj, batch_first=True)
+        obj_padded = pad_sequence(obj, batch_first=True, padding_value=pad)
+        if marker:
+            obj_padded = obj_padded.unsqueeze(-1)
         packed_obj = pack_padded_sequence(
             obj_padded.float(),
             [l if l != 0 else 1 for l in lengths],
@@ -127,6 +129,10 @@ def custom_collate(batch):
                 visit[1] = np.array([[0]]) if visit[1] is None else visit[1]
                 if isinstance(visit[0], str):
                     visit[0] = visit[1]
+
+                visit[0] = visit[0][-50:,:] if visit[0].shape[0] > 50 else visit[0]
+                visit[1] = visit[1][-50:,:] if visit[1].shape[0] > 50 else visit[1]
+
                 temp = max(visit[0].shape[0], visit[1].shape[0])
                 max_words = max(temp, max_words)
 
@@ -147,8 +153,9 @@ def custom_collate(batch):
 
     packed_featU = pad_pack(featU, nulls=torch.empty((0, 35)))
     packed_featN = pad_pack(featN, nulls=torch.empty((0, 35)))
-    packed_iatU = pad_pack(iatU, nulls=torch.tensor([torch.inf]))
-    packed_iatN = pad_pack(iatN, nulls=torch.tensor([torch.inf]))
+    pad= -torch.inf
+    packed_iatU = pad_pack(iatU, nulls=torch.tensor([pad]), pad=pad, marker=True)
+    packed_iatN = pad_pack(iatN, nulls=torch.tensor([pad]), pad=pad, marker=True)
     packed_maskU = pad_pack(maskU, nulls=torch.empty((0, 2)))
     packed_maskN = pad_pack(maskN, nulls=torch.empty((0, 2)))
     packed_histU = pad_2d(histU)
@@ -228,7 +235,7 @@ def get_model_input():
             pickle.dump(data, file)
 
     dataloader = DataLoader(
-        data, batch_size=64, collate_fn=custom_collate, shuffle=True, num_workers=20, pin_memory=True,
+        data, batch_size=32, collate_fn=custom_collate, shuffle=True, num_workers=20, pin_memory=True,
     )
 
     return dataloader
@@ -249,6 +256,10 @@ if __name__ == "__main__":
         "hist_dropout": 0.2,
         "hist_proj": 12,
         "lr": 0.001,
+        "iat_input_size_rnn": 1,
+        "iat_hidden_size_rnn": (12*2),
+        "hazard_dropout": 0.2,
+        "attn_initial_augmentation": 16,
     }
     model = NHP(**kwargs)
 
@@ -256,7 +267,7 @@ if __name__ == "__main__":
     trainer = pl.Trainer(
         max_epochs=5,
         accelerator="gpu",
-        devices=[0],
+        devices=[1],
         callbacks=[
             pl.callbacks.ModelCheckpoint(save_last=True),
             pl.callbacks.EarlyStopping(

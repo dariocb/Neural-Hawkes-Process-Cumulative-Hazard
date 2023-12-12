@@ -1,3 +1,4 @@
+from collections import OrderedDict
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,61 +9,83 @@ import pytorch_lightning as pl
 import matplotlib.pyplot as plt
 torch.set_float32_matmul_precision('medium')
 
+
+class DotProductAttention(nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        self.initial_augmentation = nn.Linear(1, n)
+
+    def forward(self, query, key, value):
+        query, key, value = query.unsqueeze(-1), key.unsqueeze(-1), value.unsqueeze(-1)
+        query, key, value = self.initial_augmentation(query), self.initial_augmentation(key), self.initial_augmentation(value)
+        # Calculate attention scores
+        attention_scores = torch.matmul(query, key.transpose(-1, -2))
+
+        # Normalize attention scores with softmax
+        attention_weights = nn.functional.softmax(attention_scores, dim=-1)
+
+        # Apply attention to values
+        attended_values = torch.matmul(attention_weights, value)
+
+        return attended_values, attention_weights
+
+
 class NHP(pl.LightningModule):
     def __init__(
-        self,
-        feat_input_size,
-        feat_hidden_size,
-        feat_n_layers,
-        feat_dropout,
-        feat_proj,
-        hist_input_size,
-        hist_hidden_size,
-        hist_n_layers,
-        hist_dropout,
-        hist_proj,
-        lr=0.001,
+        self, **kwargs
     ):
         super(NHP, self).__init__()
+
+        self.attn = DotProductAttention(kwargs['attn_initial_augmentation'])
+
         self.featRNN = nn.LSTM(
-            input_size=feat_input_size,
-            hidden_size=feat_hidden_size,
-            proj_size=feat_proj,
-            num_layers=feat_n_layers,
+            input_size=kwargs['feat_input_size'],
+            hidden_size=kwargs['feat_hidden_size'],
+            proj_size=kwargs['feat_proj'],
+            num_layers=kwargs['feat_n_layers'],
             bias=True,
             batch_first=False,
-            dropout=feat_dropout,
+            dropout=kwargs['feat_dropout'],
             bidirectional=False,
         )
 
         self.histRNN = nn.LSTM(
-            input_size=hist_input_size,
-            hidden_size=hist_hidden_size,
-            proj_size=hist_proj,
-            num_layers=hist_n_layers,
+            input_size=kwargs['hist_input_size'],
+            hidden_size=kwargs['hist_hidden_size'],
+            proj_size=kwargs['hist_proj'],
+            num_layers=kwargs['hist_n_layers'],
             bias=True,
             batch_first=True,
-            dropout=hist_dropout,
+            dropout=kwargs['hist_dropout'],
             bidirectional=False,
         )
-        self.cumulative_hazard = nn.Sequential(OrderedDict([
-            ('fc1', nn.Linear(feat_proj + hist_proj, 64)),
+        self.mlp_hazard = nn.Sequential(OrderedDict([
+            ('fc1', nn.Linear(kwargs['feat_proj'] + kwargs['hist_proj'], 64)),
             ('batch_norm1', nn.BatchNorm1d(64)),
             ('tanh1', nn.Tanh()),
-            ('dropout1', nn.Dropout(dropout_rate)),
+            ('dropout1', nn.Dropout(kwargs['hazard_dropout'])),
             ('fc2', nn.Linear(64, 16)),
             ('batch_norm2', nn.BatchNorm1d(16)),
             ('tanh2', nn.Tanh()),
-            ('dropout2', nn.Dropout(dropout_rate)),
+            ('dropout2', nn.Dropout(kwargs['hazard_dropout'])),
             ('fc3', nn.Linear(16, 1)),
             ('softplus', nn.Softplus())
         ]))
-        self.lr = lr
+
+        self.out_hazard = nn.Linear(2*kwargs['attn_initial_augmentation'], 1)
+
+        self.iat_rnn = nn.RNN(input_size=kwargs['iat_input_size_rnn'],
+                        hidden_size=kwargs['iat_hidden_size_rnn'],
+                        num_layers=1, nonlinearity='tanh', bias=True, batch_first=True, dropout=0.2)
+
+        self.lr = kwargs['lr']
         # self.loss_fn = nn.PoissonNLLLoss(log_input=False, full=False)
 
 
         # Custom constraint for positive weights
-        self.cumulative_hazard.apply(self.init_weights)
+        self.mlp_hazard.apply(self.init_weights)
+        self.out_hazard.apply(self.init_weights)
+        self.iat_rnn.apply(self.init_weights)
 
     def init_weights(self, layer):
         if isinstance(layer, nn.Linear):
@@ -70,8 +93,8 @@ class NHP(pl.LightningModule):
             if layer.bias is not None:
                 nn.init.constant_(layer.bias, 0)
 
-    def enforce_positive_weights(self):
-        for name, param in self.named_parameters():
+    def enforce_positive_weights(self, layer):
+        for name, param in layer.named_parameters():
             if 'weight' in name:
                 param.data = param.data.abs()
 
@@ -98,14 +121,25 @@ class NHP(pl.LightningModule):
         h_u = torch.cat([featU[:,-1,:], histU[:,-1,:]], dim=1)
         h_n = torch.cat([featN[:,-1,:], histN[:,-1,:]], dim=1)
 
-        packed_iatU
-        packed_iatN
+        iatU, _ = pad_packed_sequence(self.iat_rnn(packed_iatU)[0], batch_first=True)
+        iatN, _ = pad_packed_sequence(self.iat_rnn(packed_iatN)[0], batch_first=True)
+
+        cum_hazard_u = self._calculate_cumulative_hazard(h_u, given=h_n, iat=iatU[:,-1,:], iat_given=iatN[:,-1,:])
+        cum_hazard_n = self._calculate_cumulative_hazard(h_n, given=h_u, iat=iatN[:,-1,:], iat_given=iatU[:,-1,:])
 
 
-        output = self.cumulative_hazard()
+        return cum_hazard_u, cum_hazard_n
+    
+    def _calculate_cumulative_hazard(self, x, given, iat, iat_given):
 
+        attn_values, _ = self.attn(iat, iat_given, iat_given)
 
-        return output
+        x = self.mlp_hazard(torch.mean(x.unsqueeze(-1).repeat(1,1,attn_values.shape[-1]) + attn_values, dim=-1))
+        given = self.mlp_hazard(torch.mean(given.unsqueeze(-1).repeat(1,1,attn_values.shape[-1]) + attn_values, dim=-1))
+
+        
+        return x + given
+
 
     def training_step(self, batch, batch_idx):
         (
@@ -120,7 +154,7 @@ class NHP(pl.LightningModule):
         ) = batch
 
         # Example: pass packed_featU through your model
-        output = self(
+        cum_hazard_u, cum_hazard_n = self(
             packed_featU,
             packed_iatU,
             packed_maskU,
@@ -131,13 +165,17 @@ class NHP(pl.LightningModule):
             packed_histN,
         )
 
-        # Example: calculate loss
-        target = your_target_tensor  # replace with your actual target tensor
-        loss = self.loss_fn(output)
-
+        loss = self.loss_fn(cum_hazard_u, cum_hazard_n)
         return loss
+    
+    def loss_fn(cum_hazard_u, cum_hazard_n):
+        return
+
+
     def on_train_batch_end(self, out, batch, batch_idx):
-        self.enforce_positive_weights()
+        self.enforce_positive_weights(self.out_hazard)
+        self.enforce_positive_weights(self.iat_rnn)
+        self.enforce_positive_weights(self.mlp_hazard)
 
     def validation_step(self, batch, batch_idx):
         # Add validation step logic if needed
