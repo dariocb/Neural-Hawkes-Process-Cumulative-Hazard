@@ -2,6 +2,7 @@ import os
 import pickle
 from multiprocessing import Pool
 
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -268,6 +269,7 @@ if __name__ == "__main__":
     wandb_logger = WandbLogger(
         project="NeuralHawkesProcess", name="Exp1", log_model="all"
     )
+
 
     # Initialize PyTorch Lightning Trainer with early stopping
     trainer = pl.Trainer(

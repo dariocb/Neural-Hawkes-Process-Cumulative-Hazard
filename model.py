@@ -253,6 +253,7 @@ class NHP(pl.LightningModule):
             )
         return loss
 
+
     def on_train_batch_end(self, out, batch, batch_idx):
         self.enforce_positive_weights(self.out_hazard)
         self.enforce_positive_weights(self.iat_rnn)
