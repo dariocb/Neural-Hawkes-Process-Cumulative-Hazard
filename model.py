@@ -1,12 +1,11 @@
 from collections import OrderedDict
+
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
-from torch.utils.data import DataLoader
-from torch.utils.data.dataset import random_split
-import pytorch_lightning as pl
-import matplotlib.pyplot as plt
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
 
 torch.set_float32_matmul_precision("medium")
 
@@ -19,7 +18,11 @@ class Permute(torch.nn.Module):
 class NHP(pl.LightningModule):
     def __init__(self, **kwargs):
         super(NHP, self).__init__()
+
+        self.B = kwargs["batch_size"]
+
         self._permute = Permute()
+
         self.attn = nn.MultiheadAttention(
             kwargs["attn_dimension"],
             kwargs["attn_heads"],
@@ -27,6 +30,9 @@ class NHP(pl.LightningModule):
             bias=True,
             batch_first=True,
         )
+
+        self.validation_step_outputs = []
+        self.train_step_outputs = []
 
         self.featRNN = nn.LSTM(
             input_size=kwargs["feat_input_size"],
@@ -96,9 +102,8 @@ class NHP(pl.LightningModule):
                 nn.init.constant_(layer.bias, 0)
 
     def enforce_positive_weights(self, layer):
-        for name, param in layer.named_parameters():
-            if "weight" in name:
-                param.data = param.data.abs()
+        for param in layer.parameters():
+            param.data = param.data.abs()
 
     def forward(
         self,
@@ -168,38 +173,90 @@ class NHP(pl.LightningModule):
         loss = self.loss_fn(cum_hazard_u, grad_terms[0]) + self.loss_fn(
             cum_hazard_n, grad_terms[1]
         )
+        self.train_step_outputs.append(loss.detach())
         return loss
 
-    def loss_fn(self, x, grad_term):
+    def on_validation_model_eval(self, *args, **kwargs):
+        super().on_validation_model_eval(*args, **kwargs)
+        torch.set_grad_enabled(True)
+
+    def on_test_model_eval(self, *args, **kwargs):
+        super().on_test_model_eval(*args, **kwargs)
+        torch.set_grad_enabled(True)
+
+    def on_validation_epoch_end(self):
+        avg_val_loss = torch.tensor(self.validation_step_outputs).mean()
+        self.log("avg_val_loss", avg_val_loss, batch_size=self.B)
+        self.validation_step_outputs.clear()
+
+    def on_train_epoch_end(self):
+        avg_train_loss = torch.tensor(self.train_step_outputs).mean()
+        self.log("avg_train_loss", avg_train_loss, batch_size=self.B)
+        self.train_step_outputs.clear()
+
+    def validation_step(self, batch, batch_idx):
+        (
+            packed_featU,
+            packed_iatU,
+            packed_histU,
+            packed_featN,
+            packed_iatN,
+            packed_histN,
+        ) = batch
+
+        cum_hazard_u, cum_hazard_n, grad_terms = self(
+            packed_featU,
+            packed_iatU,
+            packed_histU,
+            packed_featN,
+            packed_iatN,
+            packed_histN,
+        )
+
+        val_loss = self.loss_fn(cum_hazard_u, grad_terms[0]) + self.loss_fn(
+            cum_hazard_n, grad_terms[1]
+        )
+        val_loss = val_loss.detach()
+
+        del cum_hazard_n, cum_hazard_u, grad_terms, packed_iatN, packed_iatU
+        del packed_featU, packed_featN, packed_histN, packed_histU, batch
+
+        self.validation_step_outputs.append(val_loss)
+        return val_loss
+
+    def _compute_hazard_from_cumulative(self, x, grad_term):
         x.retain_grad()
         grad_term.retain_grad()
 
         # Calculate the gradient of the output w.r.t. input
-        x.backward(gradient=torch.ones_like(x, requires_grad=True), retain_graph=True)
-        # gradient = torch.autograd.grad(outputs=x, inputs=grad_terms,
-        #                             grad_outputs=torch.ones_like(x, requires_grad=True),
-        #                             retain_graph=True, create_graph=True)[0]
+        # x.backward(gradient=torch.ones_like(x, requires_grad=True), retain_graph=True)
+        gradient = torch.autograd.grad(
+            outputs=x,
+            inputs=grad_term,
+            grad_outputs=torch.ones_like(x, requires_grad=True),
+            retain_graph=True,
+            create_graph=True,
+        )[0]
         # print(grad_term.grad)
-        x.grad.zero_()
+        self.zero_grad()
+        return gradient  # grad_term.grad
 
-        B = x.shape[0]
+    def loss_fn(self, cumulative_hazard_function, grad_term):
+        hazard_function = self._compute_hazard_from_cumulative(
+            cumulative_hazard_function, grad_term
+        )
         loss = 0
-        for _ in range(B):
-            loss -= 1 / B * torch.sum(torch.log(grad_term.grad) - x)
+        for _ in range(self.B):
+            loss -= (
+                1 / self.B
+                * torch.sum(torch.log(1+hazard_function) - cumulative_hazard_function)
+            )
         return loss
 
     def on_train_batch_end(self, out, batch, batch_idx):
         self.enforce_positive_weights(self.out_hazard)
         self.enforce_positive_weights(self.iat_rnn)
         self.enforce_positive_weights(self.mlp_hazard)
-
-    # def validation_step(self, batch, batch_idx):
-    #     # Add validation step logic if needed
-    #     pass
-
-    # def on_validation_epoch_end(self, outputs):
-    #     avg_val_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
-    #     self.log("avg_val_loss", avg_val_loss)
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.lr)

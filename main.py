@@ -1,9 +1,5 @@
 import os
-import pathlib
 import pickle
-import time
-from datetime import datetime
-from functools import partial
 from multiprocessing import Pool
 
 import matplotlib.pyplot as plt
@@ -11,19 +7,22 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from joblib import Memory
+
+from pytorch_lightning.loggers import WandbLogger
 from sklearn.preprocessing import OneHotEncoder
-from torch.nn.utils.rnn import (pack_padded_sequence, pad_packed_sequence,
-                                pad_sequence)
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.dataset import random_split
 from tqdm import tqdm
 
 from model import NHP
 
-INF = 9e15
+torch.backends.cudnn.enabled = False
+
+INF = -1
+
+BATCH_SIZE = 32
+
 
 class PatientDataset(Dataset):
     def __init__(self, appointments):
@@ -73,28 +72,32 @@ class PatientDataset(Dataset):
         ) / np.timedelta64(1, "D")
         df = df.set_index(["ID", "Fecha consulta"])
 
-        for arr in list(df[["Antecedentes psiquiátricos", "Antecedentes somáticos"]].values):
+        for arr in list(
+            df[["Antecedentes psiquiátricos", "Antecedentes somáticos"]].values
+        ):
             if isinstance(arr[0], str):
                 arr[0] = None
             if isinstance(arr[1], str):
                 arr[1] = None
 
             clinic_history = None
-            if arr[0] is not None and arr[1] is not None and len(arr[0])>0 and len(arr[1])>0:
+            if (
+                arr[0] is not None
+                and arr[1] is not None
+                and len(arr[0]) > 0
+                and len(arr[1]) > 0
+            ):
                 clinic_history = np.concatenate([arr[0], arr[1]], axis=0).tolist()
-            elif arr[0] is None and arr[1] is not None and len(arr[1])>0:
+            elif arr[0] is None and arr[1] is not None and len(arr[1]) > 0:
                 clinic_history = arr[1].tolist()
-            elif arr[1] is None and arr[0] is not None and len(arr[0])>0 :
+            elif arr[1] is None and arr[0] is not None and len(arr[0]) > 0:
                 clinic_history = arr[0].tolist()
-
 
         df = df.drop(["Antecedentes psiquiátricos", "Antecedentes somáticos"], axis=1)
 
         return {
             "feat": df.values.tolist(),
-            "iat": np.log(1 + iat).tolist()
-            if iat.size != 0
-            else [INF],
+            "iat": np.log(1 + iat).tolist() if iat.size != 0 else [INF],
             "clinic_history": clinic_history,
         }
 
@@ -102,7 +105,12 @@ class PatientDataset(Dataset):
 def pad_pack(obj, nulls, pad=0, marker=False, pack=True):
     lengths = [len(seq) if seq is not None else 0 for seq in obj]
 
-    obj = [torch.tensor(o, dtype=torch.float) if o is not None else torch.tensor(nulls, dtype=torch.float) for o in obj]
+    obj = [
+        torch.tensor(o, dtype=torch.float)
+        if o is not None
+        else torch.tensor(nulls, dtype=torch.float)
+        for o in obj
+    ]
     obj_padded = pad_sequence(obj, batch_first=True, padding_value=pad).tolist()
 
     obj_padded = torch.tensor(obj_padded, dtype=torch.float)
@@ -121,13 +129,12 @@ def pad_pack(obj, nulls, pad=0, marker=False, pack=True):
             enforce_sorted=False,
         )
         return obj_packed
-    else: 
+    else:
         return obj_padded
 
+
 def custom_collate(batch):
-
     featU, iatU, histU, featN, iatN, histN = zip(*batch)
-
 
     packed_featU = pad_pack(featU, nulls=np.zeros((1, 35)).tolist())
     packed_featN = pad_pack(featN, nulls=np.zeros((1, 35)).tolist())
@@ -202,67 +209,94 @@ def get_model_input():
     if os.path.exists(path):
         print("Loading dataset... ", end="")
         with open(path, "rb") as file:
-            data = pickle.load(file)
+            train_dataset, val_dataset = pickle.load(file)
         print("Done!")
     else:
         data = PatientDataset(merged)
-        with open(path, "wb") as file:
-            pickle.dump(data, file)
 
-    dataloader = DataLoader(
-        data, batch_size=32, collate_fn=custom_collate, shuffle=True, num_workers=20, pin_memory=True,
+        # Split the dataset into training and validation sets
+        train_size = int(0.8 * len(data))
+        val_size = len(data) - train_size
+        train_dataset, val_dataset = random_split(data, [train_size, val_size])
+
+        with open(path, "wb") as file:
+            pickle.dump((train_dataset, val_dataset), file)
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        collate_fn=custom_collate,
+        shuffle=True,
+        num_workers=20,
+        pin_memory=True,
+    )
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        collate_fn=custom_collate,
+        shuffle=False,
+        num_workers=20,
+        pin_memory=True,
     )
 
-    return dataloader
-
+    return train_dataloader, val_dataloader
 
 
 if __name__ == "__main__":
-    dataloader = get_model_input()
+    train_dataloader, val_dataloader = get_model_input()
 
     kwargs = {
+        "batch_size": BATCH_SIZE,
         "feat_input_size": 35,
         "feat_hidden_size": 128,
         "feat_n_layers": 2,
         "feat_dropout": 0.2,
         "feat_proj": 12,
-        "hist_input_size": 80, #fixed
+        "hist_input_size": 80,  # fixed
         "hist_hidden_size": 128,
         "hist_n_layers": 2,
         "hist_dropout": 0.2,
         "hist_proj": 12,
         "lr": 0.001,
         "iat_input_size_rnn": 1,
-        "iat_hidden_size_rnn": (12+12), #feat_proj + hist_proj
+        "iat_hidden_size_rnn": (12 + 12),  # feat_proj + hist_proj
         "hazard_dropout": 0.2,
-        "attn_dimension": (12+12), #feat_proj + hist_proj
+        "attn_dimension": (12 + 12),  # feat_proj + hist_proj
         "attn_heads": 2,
-
     }
     model = NHP(**kwargs)
+    wandb_logger = WandbLogger(
+        project="NeuralHawkesProcess", name="Exp1", log_model="all"
+    )
 
     # Initialize PyTorch Lightning Trainer with early stopping
     trainer = pl.Trainer(
-        max_epochs=5,
+        max_epochs=3,
         accelerator="gpu",
-        devices=[2],
+        devices=[1],
+        gradient_clip_val=1.,
         callbacks=[
             pl.callbacks.ModelCheckpoint(save_last=True),
             pl.callbacks.EarlyStopping(
                 monitor="avg_val_loss",
-                patience=3,
+                patience=5,
                 mode="min",
                 verbose=True,
                 min_delta=0.001,
             ),
+            pl.callbacks.StochasticWeightAveraging(swa_lrs=1e-2),
         ],
+        logger=wandb_logger,
+        inference_mode=False,  # always compute gradients
     )
 
     # Train the model
-    trainer.fit(model, dataloader)
+    trainer.fit(model, train_dataloader, val_dataloader)
+                # ckpt_path = "NeuralHawkesProcess/lftx3nw6/checkpoints/last.ckpt")
 
     # Plot training loss
     plt.plot(trainer.callback_metrics["avg_train_loss"])
+    plt.plot(trainer.callback_metrics["avg_val_loss"])
     plt.xlabel("Epochs")
     plt.ylabel("Average Training Loss")
     plt.title("Training Loss Over Epochs")
